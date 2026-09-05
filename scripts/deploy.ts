@@ -13,7 +13,8 @@ async function main() {
   const { viem } = await network.create();
   const publicClient = await viem.getPublicClient();
 
-  const [owner, backend] = await viem.getWalletClients();
+  const [owner, maybeBackend] = await viem.getWalletClients();
+  const backend = maybeBackend ?? owner; // 单账户网络（creditcoinTestnet）时 backend 回退到 owner
   console.log("owner   :", owner.account.address);
   console.log("backend :", backend.account.address);
 
@@ -61,12 +62,26 @@ async function main() {
   ]);
   console.log("[7] PrizePool       :", prizePool.address);
 
+  // 8. Prediction（币价押注）
+  const prediction = await viem.deployContract("Prediction", [
+    points.address,
+    priceFeed.address,
+  ]);
+  console.log("[8] Prediction      :", prediction.address);
+
+  // 9. 授权 Prediction 铸/销毁积分
+  const h3 = await points.write.setMinter([prediction.address, true], {
+    account: owner.account,
+  });
+  await publicClient.waitForTransactionReceipt({ hash: h3 });
+
   console.log("\n=== 部署完成，地址如下 ===");
   console.log("proofVerifier  =", proofVerifier.address);
   console.log("priceFeed      =", priceFeed.address);
   console.log("points         =", points.address);
   console.log("factionRegistry=", factionRegistry.address);
   console.log("prizePool      =", prizePool.address);
+  console.log("prediction     =", prediction.address);
 }
 
 main().catch((error) => {
