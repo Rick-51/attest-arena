@@ -21,10 +21,11 @@ async function main() {
   const proofVerifier = await viem.deployContract("USCProofVerifier");
   console.log("[1] USCProofVerifier:", proofVerifier.address);
 
-  // 2. PriceFeed（价格喂价，sourceChainKey=1 表示 Sepolia）
+  // 2. PriceFeed（价格喂价，sourceChainKey 表示 Sepolia，可用环境变量覆盖）
+  const SOURCE_CHAIN_KEY = BigInt(process.env.SEPOLIA_CHAIN_KEY ?? "1");
   const priceFeed = await viem.deployContract("PriceFeed", [
     proofVerifier.address,
-    1n,
+    SOURCE_CHAIN_KEY,
   ]);
   console.log("[2] PriceFeed       :", priceFeed.address);
 

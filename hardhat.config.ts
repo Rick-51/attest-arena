@@ -42,5 +42,11 @@ export default defineConfig({
       url: configVariable("SEPOLIA_RPC_URL"),
       accounts: [configVariable("SEPOLIA_PRIVATE_KEY")],
     },
+    creditcoinTestnet: {
+      type: "http",
+      chainType: "generic", // Creditcoin 是 Substrate 系，非标准 L1
+      url: configVariable("CREDITCOIN_RPC_URL"),
+      accounts: [configVariable("CREDITCOIN_PRIVATE_KEY")],
+    },
   },
 });
