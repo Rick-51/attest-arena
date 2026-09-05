@@ -1,99 +1,120 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "./IPoints.sol";
+
 /// @title FactionRegistry
-/// @notice 身份底座：管理阵营、团队、玩家地址映射，以及比赛生命周期状态机。
-///         积分不在此存储（由 ScoreAttester 唯一管理），避免双份数据不一致。
+/// @notice 身份底座（v2）：阵营钉币 + 成员交 tCTC 入场铸积分 + 金库托管 + 比赛状态机。
+///         砍掉 Team 层级；一个地址只能进一个阵营（防女巫）。
 contract FactionRegistry {
-    // ---- 状态机 ----
     enum GamePhase { NOT_STARTED, ACTIVE, FINISHED }
     GamePhase public gamePhase = GamePhase.NOT_STARTED;
 
-    // ---- 数据结构 ----
+    // 钉的币（全局枚举，与 Points 积分类型一一对应）
+    uint256 public constant COIN_BTC = 0;
+    uint256 public constant COIN_ETH = 1;
+    uint256 public constant COIN_CTC = 2;
+
     struct Faction {
         uint256 id;
         string name;
+        uint256 coinId; // 钉的币（0=BTC,1=ETH,2=CTC）
     }
 
-    struct Team {
-        uint256 id;
-        string name;
-        uint256 factionId; // 所属阵营
-        address leader;
-        address[] members; // 含 leader
-    }
-
-    // ---- 存储 ----
     mapping(uint256 => Faction) public factions;
-    mapping(uint256 => Team) public teams;
-    mapping(address => uint256) public playerTeam; // 地址 -> 团队ID（0 = 未加入）
-
     uint256 public factionCount;
-    uint256 public teamCount;
+
+    /// 地址 -> 阵营 id（0 = 未加入）
+    mapping(address => uint256) public playerFaction;
+    /// 阵营 id -> 成员地址列表
+    mapping(uint256 => address[]) public factionMembers;
+    /// 阵营金库（tCTC 入场费）
+    mapping(uint256 => uint256) public factionTreasury;
+
+    /// 积分账本（joinFaction 时铸积分）
+    IPoints public immutable points;
+
+    /// 入场费（tCTC，可配，默认 0 便于测试）
+    uint256 public entryFee;
+    /// 入场铸的积分数量（可配，默认 100）
+    uint256 public mintAmount = 100;
 
     address public owner;
 
-    // ---- 事件 ----
-    event FactionCreated(uint256 indexed factionId, string name);
-    event TeamCreated(uint256 indexed teamId, string name, uint256 indexed factionId, address indexed leader);
-    event PlayerJoined(uint256 indexed teamId, address indexed player);
+    event FactionCreated(
+        uint256 indexed factionId,
+        string name,
+        uint256 indexed coinId
+    );
+    event PlayerJoined(uint256 indexed factionId, address indexed player);
+    event EntryFeeSet(uint256 fee);
+    event MintAmountSet(uint256 amount);
     event GameStarted();
     event GameEnded();
 
-    // ---- 修饰器 ----
     modifier onlyOwner() {
         require(msg.sender == owner, "FR: not owner");
         _;
     }
 
-    constructor() {
+    constructor(address _points) {
         owner = msg.sender;
+        points = IPoints(_points);
+    }
+
+    // ---- 配置 ----
+
+    function setEntryFee(uint256 fee) external onlyOwner {
+        entryFee = fee;
+        emit EntryFeeSet(fee);
+    }
+
+    function setMintAmount(uint256 amount) external onlyOwner {
+        mintAmount = amount;
+        emit MintAmountSet(amount);
     }
 
     // ---- Owner：创建阵营（仅比赛开始前）----
-    function createFaction(string calldata name) external onlyOwner {
+
+    function createFaction(
+        string calldata name,
+        uint256 coinId
+    ) external onlyOwner {
         require(gamePhase == GamePhase.NOT_STARTED, "FR: factions locked");
         require(bytes(name).length > 0, "FR: empty name");
+        require(coinId <= COIN_CTC, "FR: bad coin");
+
         factionCount++;
-        factions[factionCount] = Faction({ id: factionCount, name: name });
-        emit FactionCreated(factionCount, name);
-    }
-
-    // ---- 玩家：创建团队并自动加入 ----
-    function createTeam(string calldata name, uint256 factionId) external returns (uint256 teamId) {
-        require(gamePhase != GamePhase.FINISHED, "FR: game finished");
-        require(bytes(name).length > 0, "FR: empty name");
-        require(factionId > 0 && factionId <= factionCount, "FR: bad faction");
-        require(playerTeam[msg.sender] == 0, "FR: already in a team");
-
-        teamCount++;
-        teams[teamCount] = Team({
-            id: teamCount,
+        factions[factionCount] = Faction({
+            id: factionCount,
             name: name,
-            factionId: factionId,
-            leader: msg.sender,
-            members: new address[](1)
+            coinId: coinId
         });
-        teams[teamCount].members[0] = msg.sender;
-        playerTeam[msg.sender] = teamCount;
-
-        emit TeamCreated(teamCount, name, factionId, msg.sender);
-        return teamCount;
+        emit FactionCreated(factionCount, name, coinId);
     }
 
-    // ---- 玩家：加入已有团队 ----
-    function joinTeam(uint256 teamId) external {
+    // ---- 成员：交 tCTC 入场费进阵营，铸积分 ----
+
+    function joinFaction(uint256 factionId) external payable {
         require(gamePhase != GamePhase.FINISHED, "FR: game finished");
-        require(playerTeam[msg.sender] == 0, "FR: already in a team");
-        require(teamId > 0 && teamId <= teamCount, "FR: bad team");
+        require(factionId > 0 && factionId <= factionCount, "FR: bad faction");
+        require(playerFaction[msg.sender] == 0, "FR: already in a faction");
+        require(msg.value >= entryFee, "FR: insufficient fee");
 
-        teams[teamId].members.push(msg.sender);
-        playerTeam[msg.sender] = teamId;
+        playerFaction[msg.sender] = factionId;
+        factionMembers[factionId].push(msg.sender);
+        if (msg.value > 0) {
+            factionTreasury[factionId] += msg.value;
+        }
 
-        emit PlayerJoined(teamId, msg.sender);
+        // 铸该阵营钉币对应的积分（coinId == pointType）
+        points.mint(factions[factionId].coinId, msg.sender, mintAmount);
+
+        emit PlayerJoined(factionId, msg.sender);
     }
 
-    // ---- Owner：开启 / 结束比赛 ----
+    // ---- 状态机 ----
+
     function startGame() external onlyOwner {
         require(gamePhase == GamePhase.NOT_STARTED, "FR: already started");
         gamePhase = GamePhase.ACTIVE;
@@ -106,7 +127,8 @@ contract FactionRegistry {
         emit GameEnded();
     }
 
-    // ---- 只读查询（供其它合约 / 前端）----
+    // ---- 只读 ----
+
     function isActive() external view returns (bool) {
         return gamePhase == GamePhase.ACTIVE;
     }
@@ -115,21 +137,24 @@ contract FactionRegistry {
         return gamePhase == GamePhase.FINISHED;
     }
 
-    function teamExists(uint256 teamId) external view returns (bool) {
-        return teamId > 0 && teamId <= teamCount;
+    function factionExists(uint256 factionId) external view returns (bool) {
+        return factionId > 0 && factionId <= factionCount;
     }
 
-    function getTeamFaction(uint256 teamId) external view returns (uint256) {
-        require(teamId > 0 && teamId <= teamCount, "FR: bad team");
-        return teams[teamId].factionId;
+    function getFactionCoin(uint256 factionId) external view returns (uint256) {
+        return factions[factionId].coinId;
     }
 
-    function getTeamLeader(uint256 teamId) external view returns (address) {
-        require(teamId > 0 && teamId <= teamCount, "FR: bad team");
-        return teams[teamId].leader;
+    function getFactionMemberCount(
+        uint256 factionId
+    ) external view returns (uint256) {
+        return factionMembers[factionId].length;
     }
 
-    function getTeamMemberCount(uint256 teamId) external view returns (uint256) {
-        return teams[teamId].members.length;
+    function getFactionMember(
+        uint256 factionId,
+        uint256 index
+    ) external view returns (address) {
+        return factionMembers[factionId][index];
     }
 }

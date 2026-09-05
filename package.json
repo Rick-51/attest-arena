@@ -4,7 +4,9 @@
   "description": "Creditcoin EVM 上的「阵营对抗 + 积分链上存证 + 奖池自动分配」项目，Solidity 合约层。",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "hardhat build",
+    "test": "hardhat test",
+    "demo": "hardhat run scripts/demo.ts"
   },
   "keywords": [],
   "author": "",

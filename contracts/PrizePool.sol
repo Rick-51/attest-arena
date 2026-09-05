@@ -2,30 +2,44 @@
 pragma solidity ^0.8.20;
 
 import "./IFactionRegistry.sol";
-import "./IScoreAttester.sol";
+import "./IPoints.sol";
+import "./IPriceFeed.sol";
 
 /// @title PrizePool
-/// @notice 托管 native 币奖池，比赛结束后按「获胜阵营 + 阵营内排名」自动分配。
-///         规则：获胜阵营独得全部奖池；阵营内 第1 40% / 第2 30% / 第3 20% / 其余 10% 按积分占比分。
-///         团队奖金统一打给 leader，由 leader 代领。
+/// @notice 结算 + 奖池（v2）。结算依据 = 成员「最终分数」（积分 × 币价涨跌幅），不再是原始积分。
+///
+/// 分配规则（MVP，两层级按占比 pro-rata，无需排序）：
+///   1. finalScore[成员] = Σ_t points[t] × multiplier[t]，其中 multiplier[t] = 1000 + deltaBps[t]
+///   2. factionScore[阵营] = Σ 该阵营成员 finalScore
+///   3. 阵营份额 = 总奖池 × factionScore / totalFactionScore
+///   4. 成员份额 = 阵营份额 × memberFinalScore / factionScore
+///
+/// 注：设计文档写的是「按排名分（比例可配置）」，MVP 先用 pro-rata（等价于按分数占比，
+/// 更公平且免去链上排序），排名比例留到 Phase 2。
 contract PrizePool {
     IFactionRegistry public immutable registry;
-    IScoreAttester public immutable scores;
+    IPoints public immutable points;
+    IPriceFeed public immutable priceFeed;
 
     address public owner;
-    uint256 public totalPrizePool; // 实际存入的 native 币余额
+    uint256 public totalPrizePool;
     bool public settled;
 
-    // 分配比例（%）
-    uint256 public constant RATIO_1ST = 40;
-    uint256 public constant RATIO_2ND = 30;
-    uint256 public constant RATIO_3RD = 20;
-    uint256 public constant RATIO_REST = 10;
+    uint256 public constant BASIS = 1000; // 涨跌 0% 的基准
+    uint256 public constant COIN_COUNT = 3; // BTC/ETH/CTC
 
-    mapping(address => uint256) public rewards; // 团队 leader -> 可领取金额
+    /// 每种币开局时的价格（captureStartPrices 时记录）
+    uint256[3] public startPrices;
+
+    /// 结算后存下的分数（供查询 / 前端展示）
+    mapping(address => uint256) public memberScores;
+    mapping(uint256 => uint256) public factionScores;
+    /// 成员 -> 可领取奖励
+    mapping(address => uint256) public rewards;
 
     event Deposited(address indexed from, uint256 amount);
-    event Settled(uint256 indexed winningFactionId, uint256 totalReward);
+    event StartPricesCaptured(uint256[3] prices);
+    event Settled(uint256 totalReward);
     event Claimed(address indexed recipient, uint256 amount);
 
     modifier onlyOwner() {
@@ -33,135 +47,122 @@ contract PrizePool {
         _;
     }
 
-    constructor(address _registry, address _scores) {
+    constructor(address _registry, address _points, address _priceFeed) {
         owner = msg.sender;
         registry = IFactionRegistry(_registry);
-        scores = IScoreAttester(_scores);
+        points = IPoints(_points);
+        priceFeed = IPriceFeed(_priceFeed);
     }
 
     receive() external payable {}
 
-    // ---- Owner：存入奖池（结算前随时可充）----
+    // ---- 充奖池（结算前随时可充）----
+
     function depositPrize() external payable onlyOwner {
         require(!settled, "PP: already settled");
         totalPrizePool += msg.value;
         emit Deposited(msg.sender, msg.value);
     }
 
-    // ---- Owner：结算（只能一次）----
-    function settlePrizes() external onlyOwner {
+    // ---- 开局后由 owner 调用，记录每种币的起始价 ----
+
+    function captureStartPrices() external onlyOwner {
+        require(!settled, "PP: settled");
+        for (uint256 t = 0; t < COIN_COUNT; t++) {
+            (uint256 p, ) = priceFeed.getPrice(t);
+            startPrices[t] = p;
+        }
+        emit StartPricesCaptured(startPrices);
+    }
+
+    // ---- 结算（只能一次）----
+
+    function settle() external onlyOwner {
         require(!settled, "PP: already settled");
         require(registry.isFinished(), "PP: game not finished");
         require(totalPrizePool > 0, "PP: empty pool");
 
-        uint256 winningFaction = _findWinningFaction();
-        require(winningFaction > 0, "PP: no scores");
+        // 1. 算每种币的 multiplier = 1000 + deltaBps
+        int256[3] memory multipliers;
+        for (uint256 t = 0; t < COIN_COUNT; t++) {
+            (uint256 endPrice, ) = priceFeed.getPrice(t);
+            multipliers[t] = _multiplier(startPrices[t], endPrice);
+        }
 
-        uint256[3] memory topTeams = _findTopTeams(winningFaction);
+        // 2. 第一遍：算每个成员 finalScore + 每个阵营 factionScore + 总阵营分
+        uint256 fc = registry.factionCount();
+        uint256 totalFactionScore = 0;
+        for (uint256 f = 1; f <= fc; f++) {
+            uint256 n = registry.getFactionMemberCount(f);
+            uint256 factionScore = 0;
+            for (uint256 i = 0; i < n; i++) {
+                address member = registry.getFactionMember(f, i);
+                uint256 s = _finalScore(member, multipliers);
+                memberScores[member] = s;
+                factionScore += s;
+            }
+            factionScores[f] = factionScore;
+            totalFactionScore += factionScore;
+        }
+        require(totalFactionScore > 0, "PP: no scores");
 
-        _allocate(winningFaction, topTeams);
+        // 3. 第二遍：两层级按占比分配
+        for (uint256 f = 1; f <= fc; f++) {
+            uint256 factionShare = (totalPrizePool * factionScores[f]) /
+                totalFactionScore;
+            if (factionShare == 0) continue;
+
+            uint256 n = registry.getFactionMemberCount(f);
+            for (uint256 i = 0; i < n; i++) {
+                address member = registry.getFactionMember(f, i);
+                uint256 s = memberScores[member];
+                if (s == 0) continue;
+                rewards[member] += (factionShare * s) / factionScores[f];
+            }
+        }
 
         settled = true;
-        emit Settled(winningFaction, totalPrizePool);
+        emit Settled(totalPrizePool);
     }
 
-    // ---- 团队 leader 代领 ----
-    function claimReward(uint256 teamId) external {
+    // ---- 领奖 ----
+
+    function claimReward() external {
         require(settled, "PP: not settled");
-        address leader = registry.getTeamLeader(teamId);
-        require(msg.sender == leader, "PP: only leader");
-
-        uint256 amount = rewards[leader];
+        uint256 amount = rewards[msg.sender];
         require(amount > 0, "PP: nothing to claim");
-        rewards[leader] = 0;
-
-        (bool ok, ) = leader.call{ value: amount }("");
+        rewards[msg.sender] = 0;
+        (bool ok, ) = msg.sender.call{ value: amount }("");
         require(ok, "PP: transfer failed");
-        emit Claimed(leader, amount);
+        emit Claimed(msg.sender, amount);
     }
 
-    // ---- 内部：找积分最高的获胜阵营 ----
-    function _findWinningFaction() internal view returns (uint256 winningFaction) {
-        uint256 bestScore = 0;
-        uint256 fc = registry.factionCount();
-        for (uint256 f = 1; f <= fc; f++) {
-            uint256 s = scores.getFactionScore(f);
-            if (s > bestScore) {
-                bestScore = s;
-                winningFaction = f;
-            }
-        }
-        return winningFaction;
+    // ---- 内部 ----
+
+    /// @dev multiplier = 1000 + deltaBps；deltaBps = (end-start)*10000/start（单位基点，1bp=0.01%）
+    function _multiplier(
+        uint256 startPrice,
+        uint256 endPrice
+    ) internal pure returns (int256) {
+        if (startPrice == 0) return int256(BASIS); // 价格未初始化，按 0% 涨跌
+        int256 deltaBps = ((int256(endPrice) - int256(startPrice)) * 10000) /
+            int256(startPrice);
+        return int256(BASIS) + deltaBps;
     }
 
-    // ---- 内部：获胜阵营内按团队积分选前 3 ----
-    function _findTopTeams(uint256 factionId) internal view returns (uint256[3] memory topTeams) {
-        uint256[3] memory topScores;
-        uint256 tc = registry.teamCount();
-        for (uint256 t = 1; t <= tc; t++) {
-            if (registry.getTeamFaction(t) != factionId) continue;
-            uint256 s = scores.getTeamScore(t);
-            if (s > topScores[0]) {
-                topScores[2] = topScores[1];
-                topTeams[2] = topTeams[1];
-                topScores[1] = topScores[0];
-                topTeams[1] = topTeams[0];
-                topScores[0] = s;
-                topTeams[0] = t;
-            } else if (s > topScores[1]) {
-                topScores[2] = topScores[1];
-                topTeams[2] = topTeams[1];
-                topScores[1] = s;
-                topTeams[1] = t;
-            } else if (s > topScores[2]) {
-                topScores[2] = s;
-                topTeams[2] = t;
-            }
+    /// @dev finalScore = Σ points[t] × multiplier[t]；跌超 10%（multiplier<0）的那类积分按 0 计
+    function _finalScore(
+        address member,
+        int256[3] memory multipliers
+    ) internal view returns (uint256) {
+        int256 total = 0;
+        for (uint256 t = 0; t < COIN_COUNT; t++) {
+            uint256 bal = points.balanceOf(t, member);
+            if (bal == 0) continue;
+            int256 m = multipliers[t];
+            if (m <= 0) continue; // 跌超 10%，该积分不计分（钳制到 0）
+            total += int256(bal) * m;
         }
-        return topTeams;
-    }
-
-    // ---- 内部：按比例分配 ----
-    function _allocate(uint256 factionId, uint256[3] memory topTeams) internal {
-        uint256 pool = totalPrizePool;
-        uint256 first = pool * RATIO_1ST / 100;
-        uint256 second = pool * RATIO_2ND / 100;
-        uint256 third = pool * RATIO_3RD / 100;
-        uint256 rest = pool * RATIO_REST / 100;
-
-        // 前 3 名；空缺名次的份额并入第 1 名
-        if (topTeams[0] != 0) {
-            uint256 amount = first;
-            if (topTeams[1] == 0) amount += second;
-            if (topTeams[2] == 0) amount += third;
-            _credit(topTeams[0], amount);
-        }
-        if (topTeams[1] != 0) _credit(topTeams[1], second);
-        if (topTeams[2] != 0) _credit(topTeams[2], third);
-
-        // 剩余 10% 按获胜阵营内其余团队积分占比分
-        uint256 totalRestScore = 0;
-        uint256 tc = registry.teamCount();
-        for (uint256 t = 1; t <= tc; t++) {
-            if (registry.getTeamFaction(t) != factionId) continue;
-            if (t == topTeams[0] || t == topTeams[1] || t == topTeams[2]) continue;
-            totalRestScore += scores.getTeamScore(t);
-        }
-
-        if (totalRestScore > 0) {
-            for (uint256 t = 1; t <= tc; t++) {
-                if (registry.getTeamFaction(t) != factionId) continue;
-                if (t == topTeams[0] || t == topTeams[1] || t == topTeams[2]) continue;
-                _credit(t, rest * scores.getTeamScore(t) / totalRestScore);
-            }
-        } else if (topTeams[0] != 0) {
-            _credit(topTeams[0], rest); // 无其余团队，10% 给第 1
-        }
-    }
-
-    function _credit(uint256 teamId, uint256 amount) internal {
-        if (amount == 0) return;
-        address leader = registry.getTeamLeader(teamId);
-        rewards[leader] += amount;
+        return uint256(total);
     }
 }
