@@ -60,6 +60,15 @@ contract PriceFeed {
         emit BackendAuthorized(backend, authorized);
     }
 
+    /// @notice 管理员直设价格（测试 / 兜底用，非跨链验证路径）。
+    function setPrice(uint256 coinId, uint256 price) external onlyOwner {
+        prices[coinId] = Price({ price: price, timestamp: block.timestamp });
+        priceHistory[coinId].push(
+            Price({ price: price, timestamp: block.timestamp })
+        );
+        emit PriceUpdated(coinId, price, block.timestamp);
+    }
+
     /// @notice 验证 Sepolia 价格事件并上链。仅后端 worker 可调。
     /// @return coinId 币种编号；price 价格；timestamp 时间戳
     function updatePrice(
