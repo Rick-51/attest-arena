@@ -1,35 +1,7 @@
-# Node modules
-/node_modules
+# OS 垃圾文件
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# Compilation output
-/dist
-
-# pnpm deploy output
-/bundle
-
-# Hardhat Build Artifacts
-/artifacts
-
-# Hardhat compilation (v2) support directory
-/cache
-
-# Typechain output
-/types
-
-# Environment files
-.env
-.env.*
-!.env.example
-
-# Hardhat coverage reports
-/coverage
-
-# Gas snapshot files
-/.gas-snapshot
-
-# Snapshot cheatcodes output
-/snapshots
-
-# Claude 配置（不上传）
-.claude/
-.agents/
+# 本地规划文档（不上传 GitHub）
+/docs/
