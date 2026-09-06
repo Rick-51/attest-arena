@@ -123,6 +123,13 @@ contract Prediction {
         emit BetPlaced(roundId, msg.sender, isUp, targetPrice, stakeAmount);
     }
 
+    // ---- 只读 ----
+
+    /// @notice 某一轮的押注数量（配合 roundBets(roundId, index) 枚举）
+    function getRoundBetCount(uint256 roundId) external view returns (uint256) {
+        return roundBets[roundId].length;
+    }
+
     // ---- 判题 ----
 
     function resolveRound(uint256 roundId) external onlyOwner {
